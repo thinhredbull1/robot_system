@@ -1,0 +1,26 @@
+<launch>
+  <!-- 単体構成: 自分で map -> odom を出す (AMCL を使わない場合)。 -->
+  <arg name="map_yaml_path" default=""/>
+  <arg name="scan_topic" default="/scan"/>
+  <arg name="odom_topic" default="/odom"/>
+  <arg name="map_topic" default="/map"/>
+  <arg name="base_frame" default="base_link"/>
+  <arg name="odom_frame" default="odom"/>
+  <arg name="tf_mode" default="map_to_odom"/>
+  <arg name="omp_num_threads" default="2"/>
+  <arg name="params_file" default="$(find oriented_field_localization)/config/params.yaml"/>
+
+  <node pkg="oriented_field_localization" type="ofl_node" name="oriented_field_localization" output="screen">
+    <env name="OMP_WAIT_POLICY" value="passive"/>
+    <env name="OMP_NUM_THREADS" value="$(arg omp_num_threads)"/>
+    <rosparam command="load" file="$(arg params_file)"/>
+    <param name="map_yaml_path" value="$(arg map_yaml_path)"/>
+    <param name="base_frame" value="$(arg base_frame)"/>
+    <param name="odom_frame" value="$(arg odom_frame)"/>
+    <param name="tf_mode" value="$(arg tf_mode)"/>
+    <param name="auto_localize" value="true"/>
+    <remap from="scan" to="$(arg scan_topic)"/>
+    <remap from="odom" to="$(arg odom_topic)"/>
+    <remap from="map" to="$(arg map_topic)"/>
+  </node>
+</launch>

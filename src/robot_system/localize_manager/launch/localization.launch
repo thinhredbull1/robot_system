@@ -1,0 +1,44 @@
+<launch>
+
+<arg name="map_file"/>
+<!-- Required: passed by localize_manager from use_oriented_field in config/localize_manager.yaml
+     (single source of truth, so no default here on purpose) -->
+<arg name="use_oriented_field"/>
+<arg name="node_start_delay" default="1.0" />  
+    <!-- Map -->
+  <arg name="open_rviz" default="true"/>
+  <arg name="move_forward_only" default="false"/>
+
+  <!-- Map server -->
+  <node pkg="map_server" name="map_server" type="map_server" args="$(arg map_file)"/>
+
+  <!-- AMCL -->
+  <include file="$(find gmcl)/examples/gmcl_diff.launch"/>
+
+  <!-- oriented_field_localization (optional): same map yaml as map_server -->
+  <group if="$(arg use_oriented_field)">
+    <include file="$(find oriented_field_localization)/launch/amcl_supervisor.launch">
+      <arg name="map_yaml_path" value="$(arg map_file)"/>
+      <arg name="amcl_pose_topic" value="/gmcl_pose"/>
+    </include>
+  </group>
+
+  <!-- move_base -->
+	<node pkg="move_base" type="move_base" respawn="false" name="move_base" output="screen" launch-prefix="bash -c 'sleep $(arg node_start_delay); $0 $@'">
+  	  	<rosparam file="$(find nox)/cfg/costmap_common_params.yaml" command="load" ns="global_costmap" />
+  	 	<rosparam file="$(find nox)/cfg/costmap_common_params.yaml" command="load" ns="local_costmap" />
+  		<rosparam file="$(find nox)/cfg/local_costmap_params.yaml" command="load" />
+  		<rosparam file="$(find nox)/cfg/global_costmap_params.yaml" command="load" />
+  		<rosparam file="$(find nox)/cfg/base_local_planner_params.yaml" command="load" />
+		<rosparam file="$(find nox)/cfg/move_base_params.yaml" command="load" />
+		<!-- <param name="base_local_planner" value="dwa_local_planner/DWAPlannerROS" /> -->
+		<param name="base_local_planner" value="teb_local_planner/TebLocalPlannerROS" />
+	</node>
+
+  <!-- rviz -->
+  <group if="$(arg open_rviz)"> 
+    <node pkg="rviz" type="rviz" name="rviz" required="true"
+          args="-d $(find localize_manager)/config/move_base.rviz"/>
+  </group>
+
+</launch>

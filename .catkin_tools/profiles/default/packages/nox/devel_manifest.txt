@@ -1,0 +1,5 @@
+nox
+/root/ros_ws/pi_ws_robot/devel/.private/nox/share/nox/cmake/noxConfig.cmake /root/ros_ws/pi_ws_robot/devel/share/nox/cmake/noxConfig.cmake
+/root/ros_ws/pi_ws_robot/devel/.private/nox/share/nox/cmake/noxConfig-version.cmake /root/ros_ws/pi_ws_robot/devel/share/nox/cmake/noxConfig-version.cmake
+/root/ros_ws/pi_ws_robot/devel/.private/nox/lib/pkgconfig/nox.pc /root/ros_ws/pi_ws_robot/devel/lib/pkgconfig/nox.pc
+/root/ros_ws/pi_ws_robot/devel/.private/nox/lib/nox/pubVelEncoderDiff.py /root/ros_ws/pi_ws_robot/devel/lib/nox/pubVelEncoderDiff.py

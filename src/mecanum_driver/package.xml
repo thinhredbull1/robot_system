@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+
+<package format="2">
+
+    <name>mecanum_driver</name>
+    <version>1.0.0</version>
+
+    <description>
+        ROS C++ driver for four-wheel mecanum robot.
+        Serial communication with ESP32 and encoder odometry.
+    </description>
+
+    <maintainer email="developer@example.com">
+        Developer
+    </maintainer>
+
+    <license>MIT</license>
+
+    <buildtool_depend>catkin</buildtool_depend>
+
+    <depend>roscpp</depend>
+    <depend>rospy</depend>
+    <depend>std_msgs</depend>
+    <depend>geometry_msgs</depend>
+    <depend>nav_msgs</depend>
+    <depend>tf</depend>
+    <depend>serial</depend>
+
+    <export>
+    </export>
+
+</package>

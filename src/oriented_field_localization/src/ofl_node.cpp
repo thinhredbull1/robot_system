@@ -1,0 +1,1026 @@
+// oriented_field_localization の ROS 1 (noetic) ノード。
+//
+// GLOBAL (地図全域の探索) と TRACK (事前姿勢の周りの局所探索) を状態機械で
+// 切り替える。
+//
+//   GLOBAL --- track_after_accepts 回連続で採択 ---> TRACK
+//   TRACK  --- max_consecutive_rejects 回連続で棄却 ---> GLOBAL
+//
+// TRACK の事前姿勢は「最後に採択した地図姿勢 + それ以降のオドメトリ差分」で、
+// スキャン時刻へ補間したオドメトリが得られない場合は、時刻の異なる姿勢を
+// 混ぜずにそのTRACK更新を棄却する。
+//
+// supervise_amcl: true にすると、自分で map -> odom を出す代わりに **AMCL を
+// 監視する**。AMCL の姿勢を毎スキャン WFRAC で検証し、壊れていると判断したときだけ
+// /initialpose で撒き直させる。閉ループでは AMCL は静的な世界では安定なのに、
+// 動く障害物と kidnap では長時間 (あるいは永久に) 戻れない (docs/nav2_closed_loop.md)。
+// 判定と鈍らせ方は reseed_policy.hpp。
+//
+// トピック:
+//   subscribe  scan       sensor_msgs/LaserScan
+//              map        nav_msgs/OccupancyGrid   (map_yaml_path 未指定のとき)
+//              odom       nav_msgs/Odometry        (use_odometry のとき)
+//              amcl_pose  geometry_msgs/PoseWithCovarianceStamped (supervise_amcl のとき)
+//   publish    ~/pose                  geometry_msgs/PoseWithCovarianceStamped
+//              /initialpose            同上 (引き継ぎ・再シードのとき)
+//              ~/candidates            geometry_msgs/PoseArray
+//   service    ~/global_localization   std_srvs/Empty   (GLOBAL 探索の強制)
+//
+// TF は REP-105 に従う。位置推定が出すのは map -> odom であって map -> base_link
+// ではない (T_map_odom = T_map_base * T_odom_base^-1)。odom を出すノードが居ない
+// 構成のために tf_mode: map_to_base も用意してある。
+#include "oriented_field_localization/oriented_field_matcher.hpp"
+#include "oriented_field_localization/map_yaml_loader.hpp"
+#include "oriented_field_localization/reseed_policy.hpp"
+#include "oriented_field_localization/runtime_support.hpp"
+#include "oriented_field_localization/seed_handoff.hpp"
+
+#include <ros/ros.h>
+#include <sensor_msgs/LaserScan.h>
+#include <nav_msgs/OccupancyGrid.h>
+#include <nav_msgs/Odometry.h>
+#include <geometry_msgs/PoseArray.h>
+#include <geometry_msgs/PoseWithCovarianceStamped.h>
+#include <geometry_msgs/TransformStamped.h>
+#include <std_srvs/Empty.h>
+#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2/exceptions.h>
+
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <stdexcept>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+using oriented_field_localization::Beam;
+using oriented_field_localization::MatcherParams;
+using oriented_field_localization::OdomHistory;
+using oriented_field_localization::OrientedFieldLocalizer;
+using oriented_field_localization::Pose2D;
+using oriented_field_localization::PoseCandidate;
+using oriented_field_localization::ReseedEvidence;
+using oriented_field_localization::ReseedPolicy;
+using oriented_field_localization::ReseedPolicyParams;
+using oriented_field_localization::reseedPosesDisagree;
+using oriented_field_localization::SeedHandoff;
+using oriented_field_localization::SeedHandoffParams;
+using oriented_field_localization::compose;
+using oriented_field_localization::inverse;
+using oriented_field_localization::localizationRequestCompletes;
+using oriented_field_localization::localizationShouldRun;
+using oriented_field_localization::relative;
+using oriented_field_localization::transformBeam;
+using oriented_field_localization::validateMatcherParams;
+using oriented_field_localization::wrapPi;
+
+namespace
+{
+double yawOf(const geometry_msgs::Quaternion & q)
+{
+  return std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+           1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+}
+
+geometry_msgs::Quaternion yawQuat(double yaw)
+{
+  geometry_msgs::Quaternion q;
+  q.z = std::sin(yaw / 2.0);
+  q.w = std::cos(yaw / 2.0);
+  return q;
+}
+
+enum class TfMode { None, MapToOdom, MapToBase };
+
+}  // namespace
+
+class OflNode
+{
+public:
+  OflNode()
+  : pnh_("~")
+  {
+    MatcherParams p;
+    p.match_resolution = param("match_resolution", p.match_resolution);
+    p.max_range = param("max_range", p.max_range);
+    p.min_range = param("min_range", p.min_range);
+    p.margin_pixels = param("margin_pixels", p.margin_pixels);
+    p.pyramid_levels = param("pyramid_levels", p.pyramid_levels);
+    p.coarse_angle_step = param("coarse_angle_step", p.coarse_angle_step);
+    p.peaks_per_angle = param("peaks_per_angle", p.peaks_per_angle);
+    p.candidate_pool_size = param("candidate_pool_size", p.candidate_pool_size);
+    p.intermediate_pool_size =
+      param("intermediate_pool_size", p.intermediate_pool_size);
+    p.refine_angle_window = param("refine_angle_window", p.refine_angle_window);
+    p.refine_search_m = param("refine_search_m", p.refine_search_m);
+    p.nms_separation_m = param("nms_separation_m", p.nms_separation_m);
+    p.nms_separation_deg = param("nms_separation_deg", p.nms_separation_deg);
+    p.normal_weight = param("normal_weight", p.normal_weight);
+    p.mass_weight = param("mass_weight", p.mass_weight);
+    p.map_normal_sigma = param("map_normal_sigma", p.map_normal_sigma);
+    p.wfrac_tolerance_m = param("wfrac_tolerance_m", p.wfrac_tolerance_m);
+    p.track_search_m = param("track_search_m", p.track_search_m);
+    p.track_angle_window_deg =
+      param("track_angle_window_deg", p.track_angle_window_deg);
+
+    wfrac_margin_ = param("wfrac_margin", 1.05);
+    global_min_margin_ = param("global_min_margin", 1.05);
+    auto_localize_ = param("auto_localize", false);
+    enable_track_ = param("enable_track", true);
+    track_after_accepts_ = param("track_after_accepts", 3);
+    max_consecutive_rejects_ = param("max_consecutive_rejects", 5);
+    max_accept_jump_m_ = param("max_accept_jump_m", 0.5);
+    max_accept_yaw_deg_ = param("max_accept_yaw_deg", 20.0);
+    // 誤ロックの検出。跳び判定だけでは足りない: 追跡が誤った場所へ乗ると、
+    // 以後の事前姿勢もその誤った場所から出るので「跳んでいない」と見えてしまい、
+    // 自分自身と整合したまま永久に戻れない (kidnap の実測で確認)。
+    // スキャン点が地図の壁に載らない割合 (WFRAC) は事前姿勢に依存しない
+    // 幾何量なので、誤ロックではっきり跳ね上がる。
+    track_max_wfrac_ = param("track_max_wfrac", 0.35);
+    use_odometry_ = param("use_odometry", true);
+    publish_initialpose_ = param("publish_initialpose", true);
+    initialpose_repeat_ = param("initialpose_repeat", 5);
+    initialpose_wait_s_ = param("initialpose_wait_s", 60);
+    // 受領確認のしきい値。AMCL は initialpose を受けると次の更新でシード近傍の
+    // 姿勢を出すので、そこまで来たら残りの再送は撒き直しの増幅にしかならない。
+    // 既定は supervise_min_disagreement_* と同じ「同じ場所」判定である。
+    SeedHandoffParams hp;
+    hp.repeat = initialpose_repeat_;
+    hp.wait_s = initialpose_wait_s_;
+    hp.ack_m = param("initialpose_ack_m", hp.ack_m);
+    hp.ack_deg = param("initialpose_ack_deg", hp.ack_deg);
+    if (hp.repeat < 1 || hp.wait_s < 0.0 || !std::isfinite(hp.wait_s) ||
+      hp.ack_m < 0.0 || !std::isfinite(hp.ack_m) ||
+      hp.ack_deg < 0.0 || !std::isfinite(hp.ack_deg))
+    {
+      throw std::invalid_argument("initialpose handoff parameters are invalid");
+    }
+    handoff_ = SeedHandoff(hp);
+    // AMCL はこの分散でパーティクルを撒き直す。既定は「この格子で解いた解の
+    // 不確かさ」に相当する控えめな値で、絞りすぎると誤差を吸収できなくなる。
+    initialpose_cov_xy_ = param("initialpose_cov_xy", 0.25);
+    initialpose_cov_yaw_ = param("initialpose_cov_yaw", 0.07);
+    // ---- AMCL の監視 ----
+    supervise_amcl_ = param("supervise_amcl", false);
+    ReseedPolicyParams rp;
+    rp.max_wfrac = param("supervise_max_wfrac", rp.max_wfrac);
+    rp.wfrac_excess = param("supervise_wfrac_excess", rp.wfrac_excess);
+    rp.min_disagreement_m =
+      param("supervise_min_disagreement_m", rp.min_disagreement_m);
+    rp.min_disagreement_deg =
+      param("supervise_min_disagreement_deg", rp.min_disagreement_deg);
+    rp.after_scans = param("supervise_after_scans", rp.after_scans);
+    rp.min_interval_s = param("supervise_min_interval_s", rp.min_interval_s);
+    if (!std::isfinite(rp.max_wfrac) || rp.max_wfrac < 0.0 || rp.max_wfrac > 1.0 ||
+      !std::isfinite(rp.wfrac_excess) || rp.wfrac_excess < 0.0 ||
+      !std::isfinite(rp.min_disagreement_m) || rp.min_disagreement_m < 0.0 ||
+      !std::isfinite(rp.min_disagreement_deg) || rp.min_disagreement_deg < 0.0 ||
+      rp.after_scans < 1 || !std::isfinite(rp.min_interval_s) || rp.min_interval_s < 0.0)
+    {
+      throw std::invalid_argument("AMCL supervision parameters are invalid");
+    }
+    reseed_ = ReseedPolicy(rp);
+    update_min_d_ = param("update_min_d", 0.2);
+    update_min_a_deg_ = param("update_min_a_deg", 15.0);
+    update_max_interval_s_ = param("update_max_interval_s", 1.0);
+    smooth_base_m_ = param("smooth_base_m", 0.0);
+    smooth_gain_ = param("smooth_gain", 0.5);
+    smooth_rot_lever_m_ = param("smooth_rot_lever_m", 0.3);
+    smooth_bypass_m_ = param("smooth_bypass_m", 0.3);
+    smooth_bypass_deg_ = param("smooth_bypass_deg", 10.0);
+    smooth_saturate_scans_ = param("smooth_saturate_scans", 5);
+    map_frame_ = param("map_frame", std::string("map"));
+    odom_frame_ = param("odom_frame", std::string("odom"));
+    base_frame_ = param("base_frame", std::string("base_link"));
+    transform_tolerance_ = param("transform_tolerance", 0.2);
+    tf_lookup_timeout_s_ = param("tf_lookup_timeout_s", 0.05);
+    odom_sync_tolerance_s_ = param("odom_sync_tolerance_s", 0.1);
+    const std::string tf_mode = param("tf_mode", std::string("none"));
+    if (tf_mode == "none") tf_mode_ = TfMode::None;
+    else if (tf_mode == "map_to_odom") tf_mode_ = TfMode::MapToOdom;
+    else if (tf_mode == "map_to_base") tf_mode_ = TfMode::MapToBase;
+    else throw std::invalid_argument("tf_mode must be one of: none, map_to_odom, map_to_base");
+    const std::string map_yaml = param("map_yaml_path", std::string(""));
+
+    validateMatcherParams(p);
+    validateNodeParams();
+
+    // margin は「テンプレートが地図の縁で切れない」ための下限を満たす必要がある。
+    // 推奨値まで上げると相関の外挿が 0 になり、DFT も最小になる。
+    if (p.margin_pixels < p.minimumMargin()) {
+      ROS_WARN(
+        "margin_pixels %d < minimum %d; raising it (poses near the map border would "
+        "otherwise be unreachable)", p.margin_pixels, p.minimumMargin());
+      p.margin_pixels = p.minimumMargin();
+    }
+    if (p.margin_pixels < p.recommendedMargin()) {
+      ROS_INFO(
+        "margin_pixels %d < recommended %d; the correlation pads by %d px extra",
+        p.margin_pixels, p.recommendedMargin(), p.recommendedMargin() - p.margin_pixels);
+    }
+    if (tf_mode_ == TfMode::MapToOdom && !use_odometry_) {
+      ROS_WARN(
+        "tf_mode=map_to_odom needs use_odometry; falling back to map_to_base");
+      tf_mode_ = TfMode::MapToBase;
+    }
+
+    localizer_ = std::make_unique<OrientedFieldLocalizer>(p);
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>();
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+    scan_sub_ = nh_.subscribe("scan", 1, &OflNode::onScan, this);
+    if (use_odometry_) {
+      odom_sub_ = nh_.subscribe("odom", 1, &OflNode::onOdom, this);
+    }
+    if (supervise_amcl_) {
+      amcl_sub_ = nh_.subscribe("amcl_pose", 1, &OflNode::onAmclPose, this);
+    }
+
+    if (map_yaml.empty()) {
+      // map_server は latched で出すので、後から購読しても最後の地図が届く
+      map_sub_ = nh_.subscribe("map", 1, &OflNode::onMap, this);
+      ROS_INFO("waiting for /map (latched)");
+    } else {
+      loadMapFromYaml(map_yaml);
+    }
+
+    pose_pub_ = pnh_.advertise<geometry_msgs::PoseWithCovarianceStamped>("pose", 10);
+    initialpose_pub_ = nh_.advertise<geometry_msgs::PoseWithCovarianceStamped>(
+      "/initialpose", 10);
+    candidates_pub_ = pnh_.advertise<geometry_msgs::PoseArray>("candidates", 10);
+    if (tf_mode_ != TfMode::None) {
+      tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>();
+    }
+
+    service_ = pnh_.advertiseService("global_localization", &OflNode::onGlobalSrv, this);
+
+    if (publish_initialpose_ && initialpose_repeat_ > 1) {
+      // /initialpose を 1 回きり volatile で出すと、購読側 (AMCL など) の
+      // activate がこちらの初回ロックより後になった場合に黙って失われる。
+      // **回数で待つのでは足りない** (実測で AMCL の activate は初回ロックの
+      // 6 秒後だった)。購読者が現れるまでは回数を消費せずに待ち、現れてから
+      // 出し直す。予算の管理と受領による打ち切りは seed_handoff.hpp。
+      initialpose_timer_ = nh_.createTimer(
+        ros::Duration(1.0), [this](const ros::TimerEvent &) {
+          Pose2D odom_now;
+          bool have_odom = false;
+          {
+            std::lock_guard<std::mutex> lk(state_mu_);
+            odom_now = odom_;
+            have_odom = has_odom_;
+          }
+          geometry_msgs::PoseWithCovarianceStamped m;
+          {
+            std::lock_guard<std::mutex> lk(initialpose_mu_);
+            const bool has_sub = initialpose_pub_.getNumSubscribers() > 0;
+            if (!handoff_.wantRepeat(has_sub, ros::Time::now().toSec())) return;
+            // 再送は生のシードではなく、シード時点からのオドメトリ差分で今の
+            // 姿勢へ運ぶ。撒き直しの間も走行は続いているので、そのまま出すと
+            // 動いた分だけ古い場所へ撒いてしまう。
+            Pose2D seed = seed_pose_;
+            if (use_odometry_ && have_odom && had_odom_at_seed_) {
+              seed = compose(seed_pose_, relative(odom_at_seed_, odom_now));
+            }
+            m = makePoseMsg(seed, ros::Time::now());
+          }
+          initialpose_pub_.publish(m);
+        });
+    }
+
+    worker_ = std::thread(&OflNode::workerLoop, this);
+    ROS_INFO( "ready (%s, TRACK %s, odometry %s, supervise %s)",
+      auto_localize_ ? "auto_localize" : "call ~/global_localization",
+      enable_track_ ? "on" : "off", use_odometry_ ? "on" : "off",
+      supervise_amcl_ ? "amcl" : "off");
+  }
+
+  ~OflNode()
+  {
+    stop_ = true;
+    cv_.notify_all();
+    if (worker_.joinable()) worker_.join();
+  }
+
+private:
+  template<class T>
+  T param(const std::string & name, const T & def)
+  {
+    T v = def;
+    pnh_.param<T>(name, v, def);
+    return v;
+  }
+
+  bool onGlobalSrv(std_srvs::Empty::Request &, std_srvs::Empty::Response &)
+  {
+    // 明示的な要求は追跡状態を捨てて GLOBAL からやり直す (kidnap 対応)
+    std::lock_guard<std::mutex> lk(state_mu_);
+    has_pose_ = false;
+    tracking_ = false;
+    consecutive_accepts_ = 0;
+    consecutive_rejects_ = 0;
+    requested_ = true;
+    cv_.notify_one();
+    return true;
+  }
+
+  void validateNodeParams() const
+  {
+    const auto finite_nonnegative = [](double value) {
+        return std::isfinite(value) && value >= 0.0;
+      };
+    if (track_after_accepts_ < 1) {
+      throw std::invalid_argument("track_after_accepts must be >= 1");
+    }
+    if (max_consecutive_rejects_ < 1) {
+      throw std::invalid_argument("max_consecutive_rejects must be >= 1");
+    }
+    if (!finite_nonnegative(wfrac_margin_) || !finite_nonnegative(global_min_margin_) ||
+      !finite_nonnegative(max_accept_jump_m_) || !finite_nonnegative(max_accept_yaw_deg_) ||
+      !finite_nonnegative(track_max_wfrac_) || track_max_wfrac_ > 1.0)
+    {
+      throw std::invalid_argument("acceptance thresholds must be finite and nonnegative");
+    }
+    if (initialpose_repeat_ < 1 || initialpose_wait_s_ < 0 ||
+      !finite_nonnegative(initialpose_cov_xy_) || !finite_nonnegative(initialpose_cov_yaw_))
+    {
+      throw std::invalid_argument("initialpose repeat/wait/covariance values are invalid");
+    }
+    if (!finite_nonnegative(update_min_d_) || !finite_nonnegative(update_min_a_deg_) ||
+      !finite_nonnegative(update_max_interval_s_) || !finite_nonnegative(smooth_base_m_) ||
+      !finite_nonnegative(smooth_gain_) || !finite_nonnegative(smooth_rot_lever_m_) ||
+      !finite_nonnegative(smooth_bypass_m_) || !finite_nonnegative(smooth_bypass_deg_) ||
+      smooth_saturate_scans_ < 1)
+    {
+      throw std::invalid_argument("update and smoothing parameters must be finite and nonnegative");
+    }
+    if (!finite_nonnegative(transform_tolerance_) || !finite_nonnegative(tf_lookup_timeout_s_) ||
+      !finite_nonnegative(odom_sync_tolerance_s_))
+    {
+      throw std::invalid_argument("TF/odometry timing parameters must be finite and nonnegative");
+    }
+    if (map_frame_.empty() || odom_frame_.empty() || base_frame_.empty()) {
+      throw std::invalid_argument("map_frame, odom_frame, and base_frame must not be empty");
+    }
+  }
+
+  void loadMapFromYaml(const std::string & yaml_path)
+  {
+    const auto map = oriented_field_localization::loadMapYaml(yaml_path);
+    setMap(map.image, map.resolution, map.origin_x, map.origin_y, map.origin_yaw);
+  }
+
+  void onMap(const nav_msgs::OccupancyGrid::ConstPtr & msg)
+  {
+    if (map_ready_) return;
+    const int w = msg->info.width, h = msg->info.height;
+    cv::Mat image(h, w, CV_8UC1, cv::Scalar(205));
+    for (int i = 0; i < w * h; i++) {
+      const int8_t v = msg->data[i];
+      if (v == 0) image.data[i] = 255;
+      else if (v >= 50) image.data[i] = 0;
+    }
+    cv::flip(image, image, 0);   // OccupancyGrid は行 0 が最小 y
+    setMap(image, msg->info.resolution,
+      msg->info.origin.position.x, msg->info.origin.position.y,
+      yawOf(msg->info.origin.orientation));
+  }
+
+  void setMap(const cv::Mat & img, double res, double ox, double oy, double oyaw)
+  {
+    const auto t0 = ros::Time::now();
+    localizer_->setMap(img, res, ox, oy, oyaw);
+    map_ready_ = true;
+    ROS_INFO( "map %dx%d @ %.3f m/px loaded in %.2f s",
+      img.cols, img.rows, res, (ros::Time::now() - t0).toSec());
+  }
+
+  void onOdom(const nav_msgs::Odometry::ConstPtr & msg)
+  {
+    std::lock_guard<std::mutex> lk(state_mu_);
+    odom_ = {msg->pose.pose.position.x, msg->pose.pose.position.y,
+      yawOf(msg->pose.pose.orientation)};
+    odom_history_.add(msg->header.stamp.toSec(), odom_);
+    has_odom_ = true;
+  }
+
+  void onAmclPose(const geometry_msgs::PoseWithCovarianceStamped::ConstPtr & msg)
+  {
+    const Pose2D amcl{msg->pose.pose.position.x, msg->pose.pose.position.y,
+      yawOf(msg->pose.pose.orientation)};
+    Pose2D odom_now;
+    bool have_odom = false;
+    {
+      std::lock_guard<std::mutex> lk(state_mu_);
+      amcl_pose_ = amcl;
+      // 受け取った時点のオドメトリを一緒に控える。AMCL の publish はこちらの
+      // スキャンと非同期なので、比べるときはこの差分で今の時刻まで運ぶ。
+      had_odom_at_amcl_ = odom_history_.lookup(
+        msg->header.stamp.toSec(), odom_sync_tolerance_s_, &odom_at_amcl_);
+      has_amcl_ = true;
+      odom_now = odom_;
+      have_odom = has_odom_;
+    }
+    // シードの受領確認。AMCL がシード近傍の姿勢を出してきたら、残りの再送は
+    // 撒き直しの増幅にしかならないので止める (docs/amcl_supervision.md の限界に
+    // 挙がっていた「1 回の追跡喪失が repeat 回に増幅される」の対策)。
+    std::lock_guard<std::mutex> lk(initialpose_mu_);
+    if (!handoff_.pending()) return;
+    Pose2D seed = seed_pose_;
+    if (use_odometry_ && have_odom && had_odom_at_seed_) {
+      seed = compose(seed_pose_, relative(odom_at_seed_, odom_now));
+    }
+    const double dm = std::hypot(amcl.x - seed.x, amcl.y - seed.y);
+    const double dd = std::fabs(wrapPi(amcl.yaw - seed.yaw)) * 180.0 / M_PI;
+    if (handoff_.observe(dm, dd)) {
+      ROS_INFO(
+        "amcl acknowledged the seed (%.2f m, %.1f deg apart); stopping repeats", dm, dd);
+    }
+  }
+
+  void onScan(const sensor_msgs::LaserScan::ConstPtr & msg)
+  {
+    {
+      // 処理中に届いたスキャンは捨てて最新だけを残す (古いスキャンで推定しても
+      // 出てくるのは過去の姿勢なので、溜めても意味が無い)
+      std::lock_guard<std::mutex> lk(mu_);
+      pending_scan_ = msg;
+    }
+    cv_.notify_one();
+  }
+
+  static std::vector<Beam> toBeams(
+    const sensor_msgs::LaserScan & s, double max_range,
+    const Pose2D & base_from_scan)
+  {
+    std::vector<Beam> beams;
+    beams.reserve(s.ranges.size());
+    const double hi = std::min(static_cast<double>(s.range_max), max_range);
+    for (size_t i = 0; i < s.ranges.size(); i++) {
+      const double r = s.ranges[i];
+      if (!std::isfinite(r) || r < s.range_min || r >= hi) continue;
+      beams.push_back(transformBeam(
+          {r, s.angle_min + s.angle_increment * static_cast<double>(i)}, base_from_scan));
+    }
+    return beams;
+  }
+
+  bool baseFromScan(const sensor_msgs::LaserScan & scan, Pose2D * out)
+  {
+    if (!out) return false;
+    if (scan.header.frame_id.empty()) {
+      ROS_WARN_THROTTLE(2.0,
+        "LaserScan has an empty frame_id; skipping");
+      return false;
+    }
+    if (scan.header.frame_id == base_frame_) {
+      *out = Pose2D();
+      return true;
+    }
+    try {
+      const auto tf = tf_buffer_->lookupTransform(
+        base_frame_, scan.header.frame_id, scan.header.stamp,
+        ros::Duration(tf_lookup_timeout_s_));
+      *out = {tf.transform.translation.x, tf.transform.translation.y,
+        yawOf(tf.transform.rotation)};
+      return true;
+    } catch (const tf2::TransformException & e) {
+      ROS_WARN_THROTTLE(2.0,
+        "cannot transform LaserScan from '%s' to '%s' at scan time: %s; skipping",
+        scan.header.frame_id.c_str(), base_frame_.c_str(), e.what());
+      return false;
+    }
+  }
+
+  void workerLoop()
+  {
+    while (!stop_) {
+      sensor_msgs::LaserScan::ConstPtr scan;
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        // 未処理のスキャンが 1 枚あり、かつ走る理由があるときだけ起きる。
+        // 走る理由 = TRACK 中 / auto_localize / サービス要求。
+        cv_.wait(lk, [this] {
+            return stop_ || (pending_scan_ && map_ready_ &&
+              localizationShouldRun(requested_, auto_localize_, tracking_));
+          });
+        if (stop_) return;
+        scan = pending_scan_;
+        pending_scan_.reset();          // 1 枚のスキャンは 1 回だけ処理する
+      }
+      if (!scan) continue;
+
+      Pose2D base_from_scan;
+      if (!baseFromScan(*scan, &base_from_scan)) continue;
+      const std::vector<Beam> beams = toBeams(
+        *scan, localizer_->params().max_range, base_from_scan);
+      if (beams.size() < 8) {
+        ROS_WARN_THROTTLE(2.0,
+          "too few valid beams (%zu); skipping", beams.size());
+        continue;
+      }
+
+      // 事前姿勢: 最後の採択姿勢 + それ以降のオドメトリ差分
+      Pose2D prior;
+      Pose2D odom_now;
+      bool have_prior = false;
+      bool have_odom = false;
+      {
+        std::lock_guard<std::mutex> lk(state_mu_);
+        have_odom = !use_odometry_ || odom_history_.lookup(
+          scan->header.stamp.toSec(), odom_sync_tolerance_s_, &odom_now);
+        if (has_pose_) {
+          prior = last_pose_;
+          if (use_odometry_ && have_odom && had_odom_at_accept_) {
+            prior = compose(last_pose_, relative(odom_at_accept_, odom_now));
+          }
+          have_prior = true;
+        }
+      }
+      if (use_odometry_ && tracking_ && !have_odom) {
+        ROS_WARN_THROTTLE(2.0,
+          "no odometry synchronized to scan stamp; skipping TRACK update");
+        continue;
+      }
+      const bool use_track = enable_track_ && tracking_ && have_prior;
+
+      // ---- 探索を動いた分だけに間引く (検証は毎スキャン走らせる) ----
+      // 高いのは相関探索 (実測 29.9 ms/scan) のほうで、WFRAC はビーム数ぶんの
+      // 地図参照だけなので桁が違う。**距離でゲートするのは探索だけにする。**
+      // 検証まで間引くと、kidnap 後に停止している間は誤ロックを検出できなくなる。
+      if (use_track && update_min_d_ > 0) {
+        const Pose2D moved = relative(pose_at_search_, prior);
+        const double since = (ros::Time::now() - last_search_).toSec();
+        const bool moved_enough =
+          std::hypot(moved.x, moved.y) >= update_min_d_ ||
+          std::fabs(moved.yaw) * 180.0 / M_PI >= update_min_a_deg_;
+        const bool timed_out =
+          update_max_interval_s_ > 0 && since >= update_max_interval_s_;
+        if (!moved_enough && !timed_out) {
+          PoseCandidate pc;
+          pc.x = prior.x; pc.y = prior.y; pc.yaw = prior.yaw;
+          const double w = localizer_->wallMissFraction(pc, beams);
+          if (!(track_max_wfrac_ > 0 && w > track_max_wfrac_)) {
+            // 事前姿勢は地図と整合している。探索せず、そのまま出す。
+            // map -> odom は前回の採択から変わらない (AMCL と同じ挙動)。
+            skipped_++;
+            PoseCandidate out;
+            out.x = prior.x; out.y = prior.y; out.yaw = prior.yaw; out.score = 0;
+            publishPose(out, odom_now, scan->header.stamp,
+              /*also_initialpose=*/false, /*snap=*/false, have_odom);
+            // **監視は探索を間引いても毎スキャン走らせる。**AMCL が外れるのは
+            // こちらが動いていない間かもしれないし、WFRAC は探索と桁が違って安い。
+            superviseAmcl(out, w, beams, odom_now);
+            continue;
+          }
+          // WFRAC が閾値を超えた: 動いていなくても探索する
+        }
+        pose_at_search_ = prior;
+        last_search_ = ros::Time::now();
+      }
+
+      const auto t0 = std::chrono::steady_clock::now();
+      std::vector<PoseCandidate> cands;
+      if (use_track) {
+        PoseCandidate pr;
+        pr.x = prior.x; pr.y = prior.y; pr.yaw = prior.yaw;
+        cands = localizer_->track(beams, pr);
+      } else {
+        cands = localizer_->localize(beams);
+      }
+      const double dt = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+
+      if (cands.empty()) {
+        onReject("no candidate", use_track);
+        continue;
+      }
+      publishCandidates(cands, scan->header.stamp);
+
+      int pick = 0;
+      if (wfrac_margin_ > 0) pick = localizer_->wfracGateSelect(cands, beams, wfrac_margin_);
+      const PoseCandidate & best = cands[pick];
+      const double margin = (cands.size() > 1 && cands[1].score > 0)
+        ? cands[0].score / cands[1].score : 1e9;
+
+      double wfrac = -1.0;
+      if (use_track) {
+        // (1) 事前姿勢からの跳び: TRACK の窓は広いので、窓の中でも遠くへ飛んだ解は
+        //     単発の誤マッチとみなして捨てる
+        const double dpos = std::hypot(best.x - prior.x, best.y - prior.y);
+        const double dyaw = std::fabs(wrapPi(best.yaw - prior.yaw)) * 180.0 / M_PI;
+        if ((max_accept_jump_m_ > 0 && dpos > max_accept_jump_m_) ||
+          (max_accept_yaw_deg_ > 0 && dyaw > max_accept_yaw_deg_))
+        {
+          onReject("jump", true, dpos, dyaw);
+          continue;
+        }
+        // (2) 幾何の整合: 誤ロックは跳びでは捕まらないので、事前姿勢に依らない
+        //     WFRAC で見る
+        if (track_max_wfrac_ > 0) {
+          wfrac = localizer_->wallMissFraction(best, beams);
+          if (wfrac > track_max_wfrac_) {
+            onReject("wfrac", true, wfrac);
+            continue;
+          }
+        }
+      } else if (margin < global_min_margin_) {
+        onReject("margin", false, margin);
+        // マージン不足で捨てたときは、サービス 1 回ぶんの要求を消費しない。
+        // 消費すると「曖昧だったので黙って何も返さない」で終わってしまう。
+        // 次のスキャンでやり直す (auto_localize なら元から毎スキャン走る)。
+        if (!auto_localize_) requested_ = true;
+        continue;
+      }
+
+      // 監視には**同じスキャンで測った自分の WFRAC**が基準線として要る。
+      // TRACK では上の (2) で測っているが、GLOBAL 採択では未測定なので補う。
+      if (supervise_amcl_ && wfrac < 0) wfrac = localizer_->wallMissFraction(best, beams);
+
+      // 追跡喪失からの再取得は従来どおり /initialpose を出すが、監視モードでは
+      // **AMCL が既に同じ場所を指しているなら出さない**。撒き直しても直るものが
+      // 無く、跳びだけが残る。
+      const bool reseed_ok = !supervise_amcl_ || amclDisagrees(best, odom_now);
+
+      onAccept(best, odom_now, scan->header.stamp, use_track, margin, dt, cands.size(),
+        wfrac, reseed_ok, have_odom);
+
+      // **自分が TRACK で自己整合しているときだけ相手を裁く。**GLOBAL の単発解は
+      // 曖昧解を引いている可能性があり、基準線として信用できない。
+      if (use_track) superviseAmcl(best, wfrac, beams, odom_now);
+      else reseed_.reset();
+    }
+  }
+
+  /// 最後に受けた AMCL の姿勢を、オドメトリで今の時刻まで運んで返す。
+  /// AMCL がまだ何も出していなければ false。
+  bool amclPoseNow(const Pose2D & odom_now, Pose2D * out)
+  {
+    std::lock_guard<std::mutex> lk(state_mu_);
+    if (!has_amcl_) return false;
+    *out = amcl_pose_;
+    if (use_odometry_ && has_odom_ && had_odom_at_amcl_) {
+      *out = compose(amcl_pose_, relative(odom_at_amcl_, odom_now));
+    }
+    return true;
+  }
+
+  /// AMCL の姿勢が自分の解と離れているか。
+  /// **まだ何も出していなければ true** (= 初期姿勢を与えるべき) を返すので、
+  /// 起動時の引き継ぎと走行中の再シードが同じ判定で書ける。
+  bool amclDisagrees(const PoseCandidate & mine, const Pose2D & odom_now)
+  {
+    Pose2D amcl;
+    if (!amclPoseNow(odom_now, &amcl)) return true;
+    ReseedEvidence e;
+    e.disagree_m = std::hypot(mine.x - amcl.x, mine.y - amcl.y);
+    e.disagree_deg = std::fabs(wrapPi(mine.yaw - amcl.yaw)) * 180.0 / M_PI;
+    return reseedPosesDisagree(e, reseed_.params());
+  }
+
+  /// AMCL の姿勢を毎スキャン検証し、壊れていると判断したときだけ再シードする。
+  /// 判定そのものは reseed_policy.hpp にあり、そちらは ROS に依存しない。
+  void superviseAmcl(
+    const PoseCandidate & mine, double my_wfrac, const std::vector<Beam> & beams,
+    const Pose2D & odom_now)
+  {
+    if (!supervise_amcl_) return;
+    Pose2D amcl;
+    if (!amclPoseNow(odom_now, &amcl)) {
+      ROS_WARN_THROTTLE(10.0,
+        "supervise_amcl is on but no amcl_pose received yet");
+      return;
+    }
+    PoseCandidate ac;
+    ac.x = amcl.x; ac.y = amcl.y; ac.yaw = amcl.yaw;
+
+    ReseedEvidence e;
+    e.wfrac_other = localizer_->wallMissFraction(ac, beams);
+    e.wfrac_self = my_wfrac;
+    e.disagree_m = std::hypot(mine.x - amcl.x, mine.y - amcl.y);
+    e.disagree_deg = std::fabs(wrapPi(mine.yaw - amcl.yaw)) * 180.0 / M_PI;
+
+    const bool fire = reseed_.update(e, ros::Time::now().toSec());
+    ROS_INFO_THROTTLE(2.0,
+      "supervise: amcl wfrac %.3f (self %.3f) apart %.2f m %.1f deg, hits %d",
+      e.wfrac_other, e.wfrac_self, e.disagree_m, e.disagree_deg, reseed_.hits());
+    if (!fire) return;
+
+    ROS_WARN(
+      "amcl looks lost (wfrac %.3f vs self %.3f, apart %.2f m, %.1f deg); reseeding",
+      e.wfrac_other, e.wfrac_self, e.disagree_m, e.disagree_deg);
+    publishInitialPose({mine.x, mine.y, mine.yaw}, ros::Time::now());
+  }
+
+  void onAccept(
+    const PoseCandidate & best, const Pose2D & odom_now, const ros::Time & stamp,
+    bool was_track, double margin, double dt, size_t n_cands, double wfrac,
+    bool reseed_ok, bool have_odom)
+  {
+    bool became_track = false;
+    bool first_lock = false;
+    {
+      std::lock_guard<std::mutex> lk(state_mu_);
+      first_lock = !has_pose_;
+      last_pose_ = {best.x, best.y, best.yaw};
+      has_pose_ = true;
+      odom_at_accept_ = odom_now;
+      had_odom_at_accept_ = have_odom;
+      consecutive_rejects_ = 0;
+      consecutive_accepts_++;
+      if (enable_track_ && !tracking_ && consecutive_accepts_ >= track_after_accepts_) {
+        tracking_ = true;
+        became_track = true;
+      }
+      if (localizationRequestCompletes(enable_track_, tracking_)) requested_ = false;
+    }
+    // GLOBAL からの採択 (初回ロック・追跡喪失からの復帰) は平滑化せず即座に反映する
+    publishPose(best, odom_now, stamp,
+      /*also_initialpose=*/!was_track && first_lock && reseed_ok,
+      /*snap=*/!was_track, have_odom);
+    ROS_INFO(
+      "%s accept (%.2f, %.2f, %.1f deg) score %.4f margin %.2f wfrac %.3f in %.0f ms "
+      "(%zu cands, skip %d)%s",
+      was_track ? "TRACK" : "GLOBAL", best.x, best.y, best.yaw * 180.0 / M_PI,
+      best.score, margin, wfrac, 1e3 * dt, n_cands, skipped_.load(),
+      became_track ? " -> TRACK" : "");
+  }
+
+  void onReject(const char * why, bool was_track, double a = 0, double b = 0)
+  {
+    bool back_to_global = false;
+    {
+      std::lock_guard<std::mutex> lk(state_mu_);
+      consecutive_accepts_ = 0;
+      consecutive_rejects_++;
+      if (tracking_ && consecutive_rejects_ >= max_consecutive_rejects_) {
+        tracking_ = false;
+        has_pose_ = false;      // 追跡喪失: 事前姿勢を捨てて GLOBAL から取り直す
+        consecutive_rejects_ = 0;
+        back_to_global = true;
+        requested_ = true;      // auto_localize でなくても 1 回は GLOBAL を回す
+      }
+    }
+    // **自分が棄却したスキャンでは相手を裁かない。**自分の WFRAC が監視の
+    // 基準線なので、それが信用できないときの差には意味が無い。
+    reseed_.reset();
+    ROS_INFO( "%s reject (%s %.2f %.2f)%s",
+      was_track ? "TRACK" : "GLOBAL", why, a, b,
+      back_to_global ? " -> GLOBAL" : "");
+  }
+
+  /// 出力する姿勢だけを鈍らせる。**内部の事前姿勢 (last_pose_) は生のまま**なので、
+  /// TRACK の引き込みも WFRAC の判定も kidnap の検出も一切変わらない。
+  ///
+  /// 平滑化するのは「前回の出力をオドメトリで伝播した予測」からの**補正量**だけで、
+  /// 実際の運動は素通りする。したがって遅れは補正量の変化率 (= オドメトリの
+  /// ドリフト率) にしか比例しない。
+  ///
+  /// snap = true (GLOBAL からの採択) と、補正が smooth_bypass_* を超えた場合は
+  /// 鈍らせない。kidnap 復帰の 10 m 級の補正を鈍らせると、数秒間まちがった姿勢で
+  /// 航行することになり、跳びより悪い。
+  Pose2D smoothOutput(
+    const Pose2D & raw, const Pose2D & odom_now, bool snap, bool have_odom)
+  {
+    const bool can_predict = has_out_ && use_odometry_ && have_odom && had_out_odom_;
+    const bool smoothing = smooth_base_m_ > 0 || smooth_gain_ > 0;
+    if (!smoothing || snap || !can_predict) {
+      out_pose_ = raw;
+      saturated_ = 0;
+    } else {
+      const Pose2D od = relative(out_odom_, odom_now);   // このスキャンの運動量
+      const Pose2D pred = compose(out_pose_, od);
+      const double dx = raw.x - pred.x, dy = raw.y - pred.y;
+      const double dyaw = wrapPi(raw.yaw - pred.yaw);
+      const double d = std::hypot(dx, dy);
+      const double dyaw_deg = std::fabs(dyaw) * 180.0 / M_PI;
+      if ((smooth_bypass_m_ > 0 && d > smooth_bypass_m_) ||
+        (smooth_bypass_deg_ > 0 && dyaw_deg > smooth_bypass_deg_))
+      {
+        out_pose_ = raw;                       // 大きい補正は即座に反映する
+        saturated_ = 0;
+      } else {
+        // 1 スキャンあたりの補正量に上限を置く (スルーレート制限)。
+        // 一次遅れではなく上限にしてあるのは、オドメトリのドリフトが旋回中に
+        // 集中するので、時定数だと遅れがそこだけ膨らんで読みにくいため。
+        // **補正権限を運動量に比例させる。**オドメトリの誤差は移動量と回転量に
+        // 比例して増える (AMCL の alpha1..alpha4 と同じ形) ので、上限を固定に
+        // すると、止まっているときは緩すぎ、激しく動いているときは足りない。
+        // 実測: オドメトリ誤差の増加は巡航で 0.21 m/s、kidnap 後の切り返しで
+        // 0.60 m/s だった。固定 0.20 m/s では後者に 3 倍足りない。
+        const double dtrans = std::hypot(od.x, od.y);
+        const double drot = std::fabs(od.yaw);
+        const double cap_m =
+          smooth_base_m_ + smooth_gain_ * (dtrans + smooth_rot_lever_m_ * drot);
+        const double cap_deg =
+          (smooth_base_m_ / std::max(smooth_rot_lever_m_, 1e-6) + smooth_gain_ * drot)
+          * 180.0 / M_PI;
+        const bool sat_pos = d > cap_m;
+        const bool sat_yaw = dyaw_deg > cap_deg;
+        if (sat_pos || sat_yaw) saturated_++; else saturated_ = 0;
+        if (smooth_saturate_scans_ > 0 && saturated_ >= smooth_saturate_scans_) {
+          // **上限に張り付いたままなら追随を諦めて飛ばす。**補正の要求が権限を
+          // 上回り続けると、bypass に届かない値 (実測 0.15 m) で遅れが安定して
+          // しまい、大きさだけ見ている bypass では検出できない。
+          out_pose_ = raw;
+          saturated_ = 0;
+        } else {
+          const double ks = sat_pos ? cap_m / d : 1.0;
+          const double kyaw = sat_yaw ? (cap_deg * M_PI / 180.0) / std::fabs(dyaw) : 1.0;
+          out_pose_ = {pred.x + ks * dx, pred.y + ks * dy, wrapPi(pred.yaw + kyaw * dyaw)};
+        }
+      }
+    }
+    out_odom_ = odom_now;
+    has_out_ = true;
+    had_out_odom_ = have_odom;
+    return out_pose_;
+  }
+
+  geometry_msgs::PoseWithCovarianceStamped makePoseMsg(
+    const Pose2D & out, const ros::Time & stamp) const
+  {
+    geometry_msgs::PoseWithCovarianceStamped m;
+    m.header.stamp = stamp;
+    m.header.frame_id = map_frame_;
+    m.pose.pose.position.x = out.x;
+    m.pose.pose.position.y = out.y;
+    m.pose.pose.orientation = yawQuat(out.yaw);
+    m.pose.covariance[0] = initialpose_cov_xy_;
+    m.pose.covariance[7] = initialpose_cov_xy_;
+    m.pose.covariance[35] = initialpose_cov_yaw_;
+    return m;
+  }
+
+  /// /initialpose を出し、購読者が現れるまで出し直す準備をする。
+  /// 再送のためにシード姿勢とその時点のオドメトリを控える (受領確認と
+  /// オドメトリ伝播に使う)。
+  void publishInitialPose(const Pose2D & seed, const ros::Time & stamp)
+  {
+    if (!publish_initialpose_) return;
+    initialpose_pub_.publish(makePoseMsg(seed, stamp));
+    Pose2D odom_now;
+    bool have_odom = false;
+    {
+      std::lock_guard<std::mutex> lk(state_mu_);
+      odom_now = odom_;
+      have_odom = has_odom_;
+    }
+    std::lock_guard<std::mutex> lk(initialpose_mu_);
+    seed_pose_ = seed;
+    odom_at_seed_ = odom_now;
+    had_odom_at_seed_ = have_odom;
+    handoff_.start(ros::Time::now().toSec());
+  }
+
+  void publishPose(
+    const PoseCandidate & c, const Pose2D & odom_now, const ros::Time & stamp,
+    bool also_initialpose, bool snap, bool have_odom)
+  {
+    const Pose2D out = smoothOutput({c.x, c.y, c.yaw}, odom_now, snap, have_odom);
+    const auto m = makePoseMsg(out, stamp);
+    pose_pub_.publish(m);
+    if (also_initialpose) {
+      publishInitialPose(out, stamp);
+      // 引き継ぎも再シードも同じ最小間隔で数える (連続して撒き直さない)
+      reseed_.noteFired(ros::Time::now().toSec());
+    }
+
+    if (!tf_broadcaster_) return;
+    if (tf_mode_ == TfMode::MapToOdom && !have_odom) {
+      ROS_WARN_THROTTLE(2.0,
+        "no odometry synchronized to scan stamp; suppressing map->odom TF");
+      return;
+    }
+    const ros::Time tf_stamp = stamp + ros::Duration(transform_tolerance_);
+    geometry_msgs::TransformStamped tf;
+    tf.header.stamp = tf_stamp;
+    if (tf_mode_ == TfMode::MapToOdom) {
+      // REP-105: 位置推定が出すのは map -> odom。
+      //   T_map_base = T_map_odom * T_odom_base  =>  T_map_odom = T_map_base * T_odom_base^-1
+      const Pose2D map_odom = compose(out, inverse(odom_now));
+      tf.header.frame_id = map_frame_;
+      tf.child_frame_id = odom_frame_;
+      tf.transform.translation.x = map_odom.x;
+      tf.transform.translation.y = map_odom.y;
+      tf.transform.rotation = yawQuat(map_odom.yaw);
+    } else {
+      tf.header.frame_id = map_frame_;
+      tf.child_frame_id = base_frame_;
+      tf.transform.translation.x = out.x;
+      tf.transform.translation.y = out.y;
+      tf.transform.rotation = yawQuat(out.yaw);
+    }
+    tf_broadcaster_->sendTransform(tf);
+  }
+
+  void publishCandidates(
+    const std::vector<PoseCandidate> & cands, const ros::Time & stamp)
+  {
+    geometry_msgs::PoseArray arr;
+    arr.header.stamp = stamp;
+    arr.header.frame_id = map_frame_;
+    for (const PoseCandidate & c : cands) {
+      geometry_msgs::Pose q;
+      q.position.x = c.x;
+      q.position.y = c.y;
+      q.orientation = yawQuat(c.yaw);
+      arr.poses.push_back(q);
+    }
+    candidates_pub_.publish(arr);
+  }
+
+  std::unique_ptr<OrientedFieldLocalizer> localizer_;
+  double wfrac_margin_ = 1.05;
+  double global_min_margin_ = 1.05;
+  bool auto_localize_ = false;
+  bool enable_track_ = true;
+  int track_after_accepts_ = 3;
+  int max_consecutive_rejects_ = 5;
+  double max_accept_jump_m_ = 0.5;
+  double max_accept_yaw_deg_ = 20.0;
+  double track_max_wfrac_ = 0.35;
+  bool use_odometry_ = true;
+  bool publish_initialpose_ = true;
+  int initialpose_repeat_ = 5;
+  int initialpose_wait_s_ = 60;
+  double initialpose_cov_xy_ = 0.25;
+  double initialpose_cov_yaw_ = 0.07;
+  bool supervise_amcl_ = false;
+  ReseedPolicy reseed_;
+  double update_min_d_ = 0.2;           ///< これだけ動くまで探索しない [m]。0 で無効
+  double update_min_a_deg_ = 15.0;      ///< 同 [deg]
+  double update_max_interval_s_ = 1.0;  ///< 停止していても この間隔では探索する [s]
+  double smooth_base_m_ = 0.0;          ///< 静止時の補正権限 [m/scan]。0 で無効
+  double smooth_gain_ = 0.5;            ///< 運動量に対する補正権限の比。0 で無効
+  double smooth_rot_lever_m_ = 0.3;     ///< 回転 [rad] を位置誤差 [m] に換算する腕
+  double smooth_bypass_m_ = 0.3;
+  double smooth_bypass_deg_ = 10.0;
+  int smooth_saturate_scans_ = 5;
+  double transform_tolerance_ = 0.2;
+  double tf_lookup_timeout_s_ = 0.05;
+  double odom_sync_tolerance_s_ = 0.1;
+  TfMode tf_mode_ = TfMode::None;
+  std::string map_frame_, odom_frame_, base_frame_;
+
+  std::atomic<bool> map_ready_{false};
+  std::atomic<bool> requested_{false};
+  std::atomic<bool> stop_{false};
+  std::atomic<bool> tracking_{false};
+
+  std::mutex mu_;                     ///< pending_scan_
+  std::condition_variable cv_;
+  sensor_msgs::LaserScan::ConstPtr pending_scan_;
+
+  std::mutex state_mu_;               ///< 追跡状態とオドメトリ
+  Pose2D last_pose_, odom_, odom_at_accept_;
+  OdomHistory odom_history_;
+  bool has_pose_ = false, has_odom_ = false, had_odom_at_accept_ = false;
+  Pose2D out_pose_, out_odom_;          ///< 出力用 (平滑化後)。内部の事前姿勢とは別
+  bool has_out_ = false, had_out_odom_ = false;
+  int saturated_ = 0;                   ///< 補正が上限に張り付いた連続回数
+  Pose2D pose_at_search_;               ///< 最後に探索したときの事前姿勢
+  ros::Time last_search_{0, 0};
+  std::atomic<int> skipped_{0};         ///< 探索を省いたスキャン数
+  int consecutive_accepts_ = 0, consecutive_rejects_ = 0;
+
+  // AMCL の最後の姿勢と、それを受けた時点のオドメトリ (比較のときに今へ運ぶ)
+  Pose2D amcl_pose_;
+  Pose2D odom_at_amcl_;
+  bool has_amcl_ = false;
+  bool had_odom_at_amcl_ = false;
+
+  std::mutex initialpose_mu_;
+  SeedHandoff handoff_;                 ///< 再送予算と受領確認 (seed_handoff.hpp)
+  Pose2D seed_pose_, odom_at_seed_;     ///< 最後のシードと、その時点のオドメトリ
+  bool had_odom_at_seed_ = false;
+  ros::Timer initialpose_timer_;
+
+  std::thread worker_;
+  ros::NodeHandle nh_;
+  ros::NodeHandle pnh_;
+  ros::Subscriber scan_sub_, map_sub_, odom_sub_, amcl_sub_;
+  ros::Publisher pose_pub_, initialpose_pub_, candidates_pub_;
+  ros::ServiceServer service_;
+  std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+};
+
+int main(int argc, char ** argv)
+{
+  ros::init(argc, argv, "oriented_field_localization");
+  try {
+    OflNode node;
+    ros::spin();
+  } catch (const std::exception & e) {
+    ROS_FATAL("oriented_field_localization: %s", e.what());
+    return 1;
+  }
+  return 0;
+}

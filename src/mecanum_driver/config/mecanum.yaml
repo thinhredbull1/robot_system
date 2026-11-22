@@ -1,0 +1,54 @@
+# ==========================================
+# SERIAL CONFIGURATION
+# ==========================================
+
+port: "/dev/esp32"
+baud: 57600
+
+# ==========================================
+# ROBOT PARAMETERS
+# ==========================================
+
+wheel_diameter: 9.5       # cm
+encoder_total: 1798
+total_length: 41.04       # cm
+
+# ==========================================
+# CONTROL PARAMETERS
+# ==========================================
+
+coeff_speed: 1.0
+max_speed: 30.0           # cm/s
+loop_rate: 40.0           # Hz
+
+# ==========================================
+# ODOMETRY PARAMETERS
+# ==========================================
+
+use_imu: false
+
+x_offset: 1.0
+y_offset: 1.0
+theta_offset: 1.0
+
+odom_frame: "odom"
+base_frame: "base_link"
+
+# Publish odom -> base_link TF
+publish_tf: false
+
+# ==========================================
+# TEST PARAMETERS
+# ==========================================
+
+test_mode: 0
+
+# 0 - Speed mode
+# 1 - Position mode
+# 2 - Normal mode
+
+start_run: 1.0
+
+distance_move: 1.0
+axis_move: 1.0
+velocity_move: 1.0

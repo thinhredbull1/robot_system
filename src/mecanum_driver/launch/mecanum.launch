@@ -1,0 +1,18 @@
+<launch>
+
+    <!-- Load robot configuration -->
+    <rosparam
+        command="load"
+        file="$(find mecanum_driver)/config/mecanum.yaml"
+    />
+
+    <!-- Mecanum robot node -->
+    <node
+        pkg="mecanum_driver"
+        type="mecanum_node"
+        name="mecanum_robot"
+        output="screen"
+        respawn="false"
+    />
+
+</launch>

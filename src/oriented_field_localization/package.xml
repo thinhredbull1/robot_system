@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>oriented_field_localization</name>
+  <version>0.1.0</version>
+  <description>2D LiDAR global localization by FFT correlation of an oriented (wall-normal) field in image space (ROS 1 port)</description>
+  <maintainer email="hijimasa@gmail.com">Masaaki Hijikata</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>roscpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>std_srvs</depend>
+  <depend>yaml-cpp</depend>
+  <depend>libopencv-dev</depend>
+</package>

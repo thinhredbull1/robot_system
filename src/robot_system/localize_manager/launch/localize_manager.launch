@@ -1,0 +1,16 @@
+<launch>
+
+    <node
+        pkg="localize_manager"
+        type="localize_manager_node.py"
+        name="localize_manager"
+        output="screen"
+    >
+        <!-- loaded into the node's private namespace (~map_directory, ~use_oriented_field, ...) -->
+        <rosparam
+            command="load"
+            file="$(find localize_manager)/config/localize_manager.yaml"
+        />
+    </node>
+
+</launch>

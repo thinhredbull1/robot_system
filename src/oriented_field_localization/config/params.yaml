@@ -1,0 +1,194 @@
+# oriented_field_localization / ofl_node の既定値 (ROS 1: ~ 名前空間へ rosparam load する)。
+# 数値の根拠は docs/benchmark.md (9 地図 x 15 外乱条件 x 40 姿勢)。
+# ---- 地図 ----
+map_yaml_path: ""            # 空なら transient_local な /map を待つ
+
+# ---- 表現 ----
+match_resolution: 0.1       # マッチング格子 [m/px]
+max_range: 10.0              # テンプレートに使う最大レンジ [m]
+min_range: 0.0               # 至近レンジゲート [m]。0 で無効
+margin_pixels: 284           # 地図外周のゼロパディング [px]。
+                             # >= ceil(max_range/match_resolution) が必須、
+                             # >= ceil(sqrt(2)*max_range/match_resolution)+1 で
+                             # 相関の外挿が 0 になり DFT が最小になる
+normal_weight: 1.0           # 法線チャネルの重み。0 で壁質量のみ (-1.5 pt)
+mass_weight: 1.0
+map_normal_sigma: 3.0        # 地図法線を作る自由空間マスクのぼかし [px]
+
+# ---- 探索 ----
+pyramid_levels: 3            # 3 が最良 (2 は 2 倍遅く精度は同等)
+coarse_angle_step: 6         # [deg]。3 は +0.4 pt で 1.7 倍遅い、9 以上は悪化
+peaks_per_angle: 8
+candidate_pool_size: 15
+intermediate_pool_size: 8
+refine_angle_window: 2       # [deg]
+refine_search_m: 0.2         # [m]
+nms_separation_m: 2.0
+nms_separation_deg: 15
+
+# ---- TRACK (事前姿勢の周りの局所探索) ----
+enable_track: true           # false で常に GLOBAL
+track_search_m: 3.0          # 事前姿勢からの位置探索半径 [m]。
+                             # 事前誤差が窓の内側なら実測 100% で引き込む
+track_angle_window_deg: 30   # 事前姿勢からの角度探索幅 [deg]
+track_after_accepts: 3       # 連続採択が この回数に達したら TRACK へ移る
+max_consecutive_rejects: 5   # 連続棄却が この回数に達したら GLOBAL へ戻る
+max_accept_jump_m: 0.5       # TRACK で事前姿勢からこれ以上跳んだ解は捨てる [m]。
+                             # **1 スキャン分の事前姿勢の誤差より十分大きく、
+                             # 曖昧解までの距離より小さく**取る。0.5 m/s・10 Hz
+                             # なら 1 スキャンの実移動は 0.05 m なので 10 倍の
+                             # 余裕がある。自己相似な廊下では曖昧解が 2 m 先に
+                             # 立つので、以前の既定 2.0 ではすり抜けていた
+                             # (静的 4 走行中 2 走行で 3.5 m 級の逸脱。
+                             #  0.5 にすると 7 走行中 6 走行で逸脱ゼロ、
+                             #  最大誤差 3.76 m -> 0.38 m。
+                             #  docs/nav2_closed_loop.md)。
+                             # 走行が速い / スキャンが遅い / オドメトリが悪い
+                             # 場合は、1 スキャンの事前誤差の 10 倍を目安に上げる
+max_accept_yaw_deg: 20.0     # 同上 [deg]。0 で無効
+track_max_wfrac: 0.35        # TRACK 中、スキャン点が地図の壁に載らない割合が
+                             # この値を超えたら棄却する。0 で無効。
+                             # **跳び判定だけでは誤ロックを検出できない**
+                             # (誤った場所へ乗ると以後の事前姿勢もそこから
+                             #  出るので「跳んでいない」と見えてしまう)。
+                             # WFRAC は事前姿勢に依存しない幾何量なので、
+                             # kidnap のような誤ロックで跳ね上がる
+use_odometry: true           # /odom で事前姿勢を伝播する。false なら
+                             # 最後の採択姿勢をそのまま事前姿勢にする
+
+# ---- 採択 ----
+wfrac_margin: 1.05           # 拮抗帯 (top1/top2 < この値) でだけ WFRAC で
+                             # 選び直す。0 で無効。1.05 は 9 地図で較正した値
+wfrac_tolerance_m: 0.10
+global_min_margin: 1.05      # top1/top2 がこれ未満なら publish しない
+                             # (1.0 で実質無効)。
+                             # **max_accept_jump_m を絞るならこれも要る。**
+                             # 跳び判定を絞ると TRACK の棄却が増えて GLOBAL の
+                             # やり直しも増え (実測 6-12 回 -> 9-18 回)、その
+                             # 1 回ごとが曖昧解を引く「くじ」になる。実測では
+                             # 大きく外した走行にだけマージン 1.01-1.02 の
+                             # GLOBAL 採択が 1 件ずつあり、逸脱ゼロの走行には
+                             # 1 件も無かった。静的 8 走行の GLOBAL 採択 42 件
+                             # のうち 1.05 未満は 1 件だけで、それがちょうど
+                             # 5.85 m 外した採択だった (残り 41 件は誤差 0.1 m 未満)。
+                             # 棄却してもサービス要求は消費しないので、
+                             # 呼び出し側へ何も返らないことにはならない
+
+# ---- 探索の間引き ----
+# **高いのは相関探索 (実測 29.9 ms/スキャン) だけ**で、WFRAC の検証はビーム数
+# ぶんの地図参照しかしない。そこで探索だけを動いた分に間引き、検証は毎スキャン
+# 走らせる。検証まで間引くと、kidnap 後に停止している間は誤ロックを検出でき
+# なくなる (AMCL と同じ弱点を持ち込むことになる)。
+#
+# 実測 (閉ループ 300 秒, 6 スレッド): 探索 3151 -> 702 回、CPU 0.78 -> 0.19 コア。
+# 中央値誤差は 0.040 -> 0.036 m で不変、kidnap 復帰も 0.8 s のまま。
+# おまけに **1 ステップの不連続が 0.050 -> 0.022 m と半減する** —
+# 更新の間 map -> odom が固定されオドメトリ伝播そのものになるためで、
+# AMCL が滑らかな理由と同じ機構である。
+update_min_d: 0.2            # これだけ動くまで TRACK の探索をしない [m]。0 で無効
+update_min_a_deg: 15.0       # 同 [deg]
+update_max_interval_s: 3.0   # 停止していても この間隔では探索する [s]。0 で無効。
+                             # WFRAC が正常に見えたまま誤ロックしている場合の保険
+
+# ---- 出力の平滑化 (既定は無効) ----
+# **出力する姿勢だけ**を鈍らせる。内部の事前姿勢 (次の TRACK の起点) は生の
+# 採択姿勢のままなので、引き込み・WFRAC の判定・kidnap の検出は変わらない。
+# 鈍らせるのは「前回の出力をオドメトリで伝播した予測」からの**補正量**だけで、
+# 実際の運動は素通りする。
+#
+# **既定では無効にしてある。**確実に良くなるのは 1 ステップの不連続だけで
+# (閉ループ 95% で 0.049 -> 0.031 m)、しきい値の再校正で大きい跳びが消えた今、
+# その不連続が何かを損ねている測定が無いため。出力をオドメトリの品質に
+# 結合させる副作用のほうが確実に増える。
+# **上の update_min_d のほうが、同じ滑らかさを CPU 4 分の 1 で得られる**ので、
+# まずそちらを使うこと。それでも足りない場合の追加手段として残してある。
+# 推奨は smooth_base_m: 0.005 / smooth_gain: 0.5。3 方式の比較は
+# docs/nav2_closed_loop.md。
+smooth_base_m: 0.0        # 静止時の 1 スキャンあたり補正権限 [m]。0 で無効
+smooth_gain: 0.5          # **運動量に比例する**ぶんの補正権限。
+                          # 上限を固定にすると、止まっているときは緩すぎ、
+                          # 激しく動いているときは足りない。オドメトリ誤差は
+                          # 移動量と回転量に比例して増えるので (AMCL の
+                          # alpha1..alpha4 と同じ形)、権限もそれに比例させる。
+                          # 実測: オドメトリ誤差の増加は巡航 0.21 m/s に対し
+                          # kidnap 後の切り返しで 0.60 m/s。固定 0.20 m/s では
+                          # 後者に 3 倍足りず、0.15 m の定常遅れが残った
+smooth_rot_lever_m: 0.3   # 回転 [rad] を位置誤差 [m] へ換算する腕の長さ
+smooth_bypass_m: 0.3      # これを超える補正は鈍らせず即座に反映する [m]。
+                          # kidnap 復帰の 10 m 級の補正を鈍らせると数秒間
+                          # まちがった姿勢で航行することになり、跳びより悪い
+smooth_bypass_deg: 10.0   # 同 [deg]
+smooth_saturate_scans: 5  # 補正が上限に張り付いた回数がこれに達したら追随を
+                          # 諦めて飛ばす。**大きさだけ見る bypass では、権限を
+                          # 超え続けたときの定常遅れ (実測 0.15 m) を検出できない**
+# GLOBAL からの採択 (初回ロックと追跡喪失からの復帰) は常に即座に反映する。
+# オドメトリが無い (use_odometry: false / /odom 未着) ときは予測を作れないので
+# 自動的に無効になる。
+
+# ---- 出力 ----
+auto_localize: false         # true でスキャンごとに GLOBAL を自動実行
+                             # (TRACK 中はこれに関係なく毎スキャン走る)
+publish_initialpose: true    # GLOBAL から初めて採択したときだけ /initialpose
+                             # へ流す (AMCL への引き継ぎ)。以降は ~/pose のみ。
+                             # 追跡を失って GLOBAL へ戻った後の再取得でも出る
+initialpose_repeat: 5        # /initialpose を 1 秒間隔でこの回数まで出し直す。
+                             # 1 回きりだと、購読側の activate がこちらの初回
+                             # ロックより後になったときに黙って失われる
+                             # (実測: AMCL の activate は初回ロックの 6 秒後)。
+                             # **購読者が居ない間は回数を消費せずに待つ**ので、
+                             # 起動順に依存しない
+initialpose_wait_s: 60       # 購読者を待つ上限 [s]。誰も来なければ諦める
+initialpose_ack_m: 0.5       # 受領確認: シード後の amcl_pose がシード (オドメトリで
+                             # 現在へ運んだもの) からこれ以内なら受領とみなし、
+                             # **残りの再送を止める**。再送は AMCL に届くたびに
+                             # パーティクルを撒き直させるので、1 回の再シード判断が
+                             # repeat 回の撒き直しに増幅されるのを断つ。
+                             # supervise_amcl のとき (amcl_pose を購読するとき) だけ働く
+initialpose_ack_deg: 20.0    # 同 [deg]。0 で角度は見ない
+initialpose_cov_xy: 0.25     # /initialpose と ~/pose に載せる分散 [m^2]。
+                             # AMCL はこれでパーティクルを撒き直すので、
+                             # 絞りすぎると引き渡した誤差を吸収できなくなる
+initialpose_cov_yaw: 0.07    # 同 [rad^2]
+
+# ---- AMCL の監視 (既定は無効) ----
+# true にすると、自分で map -> odom を出す代わりに **AMCL を監視する**。
+# AMCL の姿勢を毎スキャン WFRAC で検証し、壊れていると判断したときだけ
+# /initialpose で撒き直させる。tf_mode: none と組にして使う。
+#
+# **なぜ AMCL を監視する価値があるか。**閉ループ 300 秒の実測で、AMCL は
+# 静的な世界では本手法より安定だが、地図に無い動く障害物では 3 回中 2 回で
+# 22 秒・106 秒のあいだ 0.5 m 以上外れ、kidnap では 2 回中 2 回とも最後まで
+# 戻らなかった (docs/nav2_closed_loop.md)。AMCL は大域探索を持たないので、
+# 一度外れると自力では戻れない。
+#
+# **なぜ WFRAC の絶対値では判定できないか。**地図に無い障害物があると正常時の
+# WFRAC そのものが 0.50 近くまで上がるので、静的な世界で較正した 0.35 では
+# 誤ロックと区別がつかない。**同じスキャンで測った自分の WFRAC を基準線にして
+# その差を見る**と、障害物は両方に同じだけ乗るので相殺される。
+#
+# **再シードは無料ではない。**/initialpose はパーティクルを撒き直すので、
+# それ自体が姿勢の跳びを作り、局所 costmap が odom フレームにある以上は
+# 経路が無効になって follow_path が abort する (実測 2.5 秒の停止)。
+# 誤発火のコストは検出の遅れより高いので、連続回数と最小間隔で鈍らせてある。
+supervise_amcl: false
+supervise_max_wfrac: 0.35        # 相手の WFRAC がこれ以下なら健全とみなす
+supervise_wfrac_excess: 0.15     # **自分の WFRAC からの超過分**の下限。
+                                 # 実測の分離: 正常 0.00 / 障害物込み 0.50 /
+                                 # 誤ロック 0.74。障害物は両方に乗るので
+                                 # 差は 0.02 程度にしかならない
+supervise_min_disagreement_m: 0.5   # これ以上離れていなければ再シードしない [m]。
+                                    # 同じ場所を指しているなら撒き直しても
+                                    # 直るものが無く、跳びだけが残る
+supervise_min_disagreement_deg: 20.0  # 同 [deg]。0 で無効
+supervise_after_scans: 10        # 証拠がこの回数連続したら発火する
+                                 # (10 Hz なら 1 秒ぶん)
+supervise_min_interval_s: 10.0   # 再シードの最小間隔 [s]。起動時の引き継ぎとも
+                                 # 共有するので、撒き直しは連発しない
+tf_mode: "none"              # none / map_to_odom / map_to_base
+                             # map_to_odom は REP-105 準拠 (use_odometry 必須)
+transform_tolerance: 0.2     # TF を先付けする時間 [s]
+tf_lookup_timeout_s: 0.05    # scan時刻の base_frame <- scan frame を待つ上限 [s]
+odom_sync_tolerance_s: 0.1   # 補間範囲外で最近傍odomを許す最大時刻差 [s]
+map_frame: "map"
+odom_frame: "odom"
+base_frame: "base_link"

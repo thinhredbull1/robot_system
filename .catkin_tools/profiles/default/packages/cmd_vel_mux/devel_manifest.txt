@@ -1,0 +1,5 @@
+robot_system/cmd_vel_mux
+/root/ros_ws/pi_ws_robot/devel/.private/cmd_vel_mux/share/cmd_vel_mux/cmake/cmd_vel_muxConfig-version.cmake /root/ros_ws/pi_ws_robot/devel/share/cmd_vel_mux/cmake/cmd_vel_muxConfig-version.cmake
+/root/ros_ws/pi_ws_robot/devel/.private/cmd_vel_mux/share/cmd_vel_mux/cmake/cmd_vel_muxConfig.cmake /root/ros_ws/pi_ws_robot/devel/share/cmd_vel_mux/cmake/cmd_vel_muxConfig.cmake
+/root/ros_ws/pi_ws_robot/devel/.private/cmd_vel_mux/lib/pkgconfig/cmd_vel_mux.pc /root/ros_ws/pi_ws_robot/devel/lib/pkgconfig/cmd_vel_mux.pc
+/root/ros_ws/pi_ws_robot/devel/.private/cmd_vel_mux/lib/cmd_vel_mux/cmd_vel_mux_node.py /root/ros_ws/pi_ws_robot/devel/lib/cmd_vel_mux/cmd_vel_mux_node.py

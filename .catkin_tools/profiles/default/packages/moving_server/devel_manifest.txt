@@ -1,0 +1,9 @@
+robot_system/moving_server
+/root/ros_ws/pi_ws_robot/devel/.private/moving_server/share/moving_server/cmake/moving_serverConfig-version.cmake /root/ros_ws/pi_ws_robot/devel/share/moving_server/cmake/moving_serverConfig-version.cmake
+/root/ros_ws/pi_ws_robot/devel/.private/moving_server/share/moving_server/cmake/moving_serverConfig.cmake /root/ros_ws/pi_ws_robot/devel/share/moving_server/cmake/moving_serverConfig.cmake
+/root/ros_ws/pi_ws_robot/devel/.private/moving_server/lib/pkgconfig/moving_server.pc /root/ros_ws/pi_ws_robot/devel/lib/pkgconfig/moving_server.pc
+/root/ros_ws/pi_ws_robot/devel/.private/moving_server/lib/python3/dist-packages/moving_server/__init__.py /root/ros_ws/pi_ws_robot/devel/lib/python3/dist-packages/moving_server/__init__.py
+/root/ros_ws/pi_ws_robot/devel/.private/moving_server/lib/moving_server/mock_dock_detector_node.py /root/ros_ws/pi_ws_robot/devel/lib/moving_server/mock_dock_detector_node.py
+/root/ros_ws/pi_ws_robot/devel/.private/moving_server/lib/moving_server/move_command_client.py /root/ros_ws/pi_ws_robot/devel/lib/moving_server/move_command_client.py
+/root/ros_ws/pi_ws_robot/devel/.private/moving_server/lib/moving_server/odom_reset_node.py /root/ros_ws/pi_ws_robot/devel/lib/moving_server/odom_reset_node.py
+/root/ros_ws/pi_ws_robot/devel/.private/moving_server/lib/moving_server/moving_server_node.py /root/ros_ws/pi_ws_robot/devel/lib/moving_server/moving_server_node.py

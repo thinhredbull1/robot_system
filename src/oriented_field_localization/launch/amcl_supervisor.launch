@@ -1,0 +1,30 @@
+<launch>
+  <!-- AMCL (gmcl) の監視役 + 初期姿勢の自動付与。map -> odom は AMCL 側が出す。
+       AMCL の initial pose を人が与える代わりに、このノードが /initialpose を出す。 -->
+  <arg name="map_yaml_path" default="" doc="map_server 形式の YAML。空なら /map を待つ"/>
+  <arg name="scan_topic" default="/scan"/>
+  <arg name="odom_topic" default="/odom"/>
+  <arg name="map_topic" default="/map"/>
+  <arg name="amcl_pose_topic" default="/amcl_pose" doc="監視する側が出す姿勢 (gmcl なら /gmcl_pose)"/>
+  <arg name="base_frame" default="base_link"/>
+  <arg name="odom_frame" default="odom"/>
+  <arg name="omp_num_threads" default="1"/>
+  <arg name="params_file" default="$(find oriented_field_localization)/config/params.yaml"/>
+
+  <node pkg="oriented_field_localization" type="ofl_node" name="oriented_field_localization" output="screen">
+    <env name="OMP_WAIT_POLICY" value="passive"/>
+    <env name="OMP_NUM_THREADS" value="$(arg omp_num_threads)"/>
+    <rosparam command="load" file="$(arg params_file)"/>
+    <param name="map_yaml_path" value="$(arg map_yaml_path)"/>
+    <param name="base_frame" value="$(arg base_frame)"/>
+    <param name="odom_frame" value="$(arg odom_frame)"/>
+    <param name="tf_mode" value="none"/>
+    <param name="supervise_amcl" value="true"/>
+    <param name="auto_localize" value="true"/>
+    <param name="publish_initialpose" value="true"/>
+    <remap from="scan" to="$(arg scan_topic)"/>
+    <remap from="odom" to="$(arg odom_topic)"/>
+    <remap from="map" to="$(arg map_topic)"/>
+    <remap from="amcl_pose" to="$(arg amcl_pose_topic)"/>
+  </node>
+</launch>

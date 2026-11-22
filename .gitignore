@@ -1,0 +1,7 @@
+.vscode/
+.claude/
+build/
+devel/
+install/
+log/
+logs/

@@ -1,0 +1,5 @@
+map_directory: maps
+state_publish_rate: 2.0
+# true: when localization starts, also launch oriented_field_localization
+# with the same map (gives gmcl an automatic initial pose and reseeds it if lost)
+use_oriented_field: true
