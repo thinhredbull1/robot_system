@@ -1,0 +1,6 @@
+<!-- Run next to: roslaunch nexus_4wd_mecanum_gazebo gazebo_sim.launch -->
+<launch>
+  <include file="$(find mecanum_odom_fusion)/launch/odom_fusion.launch">
+    <arg name="base_frame" value="base_footprint"/>
+  </include>
+</launch>

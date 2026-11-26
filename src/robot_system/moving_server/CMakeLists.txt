@@ -39,6 +39,7 @@ catkin_install_python(
     scripts/odom_reset_node.py
     scripts/mock_dock_detector_node.py
     scripts/move_command_client.py
+    scripts/audio_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

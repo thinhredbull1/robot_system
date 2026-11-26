@@ -1,0 +1,35 @@
+<launch>
+  <!-- Frames and topics. Defaults are for the real robot. -->
+  <arg name="base_frame" default="base_link"/>
+  <arg name="odom_frame" default="odom"/>
+  <arg name="scan_topic" default="/scan"/>
+  <arg name="wheel_odom_topic" default="/odom"/>
+  <arg name="laser_odom_topic" default="/odom_rf2o"/>
+  <arg name="fused_odom_topic" default="/odom_fused"/>
+  <arg name="use_rf2o" default="true"/>
+  <!-- Only ONE node may publish odom -> base_frame -->
+  <arg name="publish_tf" default="true"/>
+  <arg name="config" default="$(find mecanum_odom_fusion)/config/ekf.yaml"/>
+
+  <node if="$(arg use_rf2o)" pkg="rf2o_laser_odometry" type="rf2o_laser_odometry_node"
+        name="rf2o_laser_odometry" output="screen">
+    <param name="laser_scan_topic" value="$(arg scan_topic)"/>
+    <param name="odom_topic" value="$(arg laser_odom_topic)"/>
+    <param name="base_frame_id" value="$(arg base_frame)"/>
+    <param name="odom_frame_id" value="$(arg odom_frame)"/>
+    <param name="publish_tf" value="false"/>
+    <param name="init_pose_from_topic" value=""/>
+    <param name="freq" value="20.0"/>
+    <param name="verbose" value="false"/>
+  </node>
+
+  <node pkg="mecanum_odom_fusion" type="odom_fusion_node" name="odom_fusion" output="screen">
+    <rosparam command="load" file="$(arg config)"/>
+    <param name="base_frame" value="$(arg base_frame)"/>
+    <param name="odom_frame" value="$(arg odom_frame)"/>
+    <param name="publish_tf" value="$(arg publish_tf)"/>
+    <remap from="odom_wheel" to="$(arg wheel_odom_topic)"/>
+    <remap from="odom_laser" to="$(arg laser_odom_topic)"/>
+    <remap from="odom_fused" to="$(arg fused_odom_topic)"/>
+  </node>
+</launch>

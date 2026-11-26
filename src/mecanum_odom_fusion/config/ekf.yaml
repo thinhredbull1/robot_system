@@ -1,0 +1,37 @@
+# Parameters of mecanum_odom_fusion/odom_fusion_node
+# wheel/stddev is [vx (m/s), vy (m/s), wz (rad/s)].
+# A SMALLER stddev means the filter trusts that source MORE.
+
+publish_rate: 50.0
+sensor_timeout: 0.5     # s without input before the pose is held
+history_length: 2.0     # s kept for replay, must exceed the laser odometry latency
+
+# Acceleration noise of the motion model [x, y, yaw].
+# Larger: follows the sensors faster. Smaller: smoother but lags.
+process_noise: [0.5, 0.5, 1.0]
+
+wheel:
+  velocity_source: "twist"      # "twist", or "pose" to differentiate the pose
+  stddev: [0.15, 0.20, 0.40]    # mecanum: vy and wz are the weak axes
+  gate: 25.0                    # squared Mahalanobis distance, 0 = off
+  max_consecutive_rejects: 5
+
+laser:
+  enabled: true
+  # Error of ONE scan-to-scan motion estimate [dx (m), dy (m), dyaw (rad)]
+  increment_stddev: [0.005, 0.005, 0.001]
+  gate: 0.0                     # off: the state mostly follows the 50 Hz wheels,
+                                # so gating could reject the laser during a slip
+  max_consecutive_rejects: 3
+  max_linear_velocity: 1.5      # faster than this is a scan matching failure
+  max_angular_velocity: 3.0
+  max_interval: 1.0             # s, longer gaps are not used (lidar runs at 5 Hz)
+
+# When wheel and laser disagree on an axis, the wheel stddev of that axis is
+# multiplied by stddev_scale. This trusts the laser: disable it where scan
+# matching is unreliable (featureless corridor, large open space).
+slip_detection:
+  enabled: true
+  linear_threshold: 0.10        # m/s
+  angular_threshold: 0.20       # rad/s
+  stddev_scale: 5.0

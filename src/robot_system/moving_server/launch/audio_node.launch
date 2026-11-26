@@ -1,0 +1,21 @@
+<launch>
+
+  <!-- Reports a reached MOVE_TO_POINT goal to the delivery server -->
+  <arg name="robot_id" default="MEDIBOT-01"/>
+  <arg name="verify_ssl" default="true"/>
+  <arg name="auth_token" default=""/>
+
+  <node pkg="moving_server"
+        type="audio_node.py"
+        name="audio_node"
+        output="screen">
+
+    <param name="url"
+           value="https://34.172.236.168:8081/api/v1/robots/$(arg robot_id)/deliveries/completions"/>
+    <param name="verify_ssl" value="$(arg verify_ssl)"/>
+    <param name="auth_token" value="$(arg auth_token)"/>
+    <param name="timeout" value="5.0"/>
+
+  </node>
+
+</launch>
