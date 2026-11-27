@@ -6,8 +6,18 @@
 <arg name="use_oriented_field"/>
 <arg name="node_start_delay" default="1.0" />  
     <!-- Map -->
-  <arg name="open_rviz" default="true"/>
+  <arg name="open_rviz" default="false"/>
   <arg name="move_forward_only" default="false"/>
+
+  <!-- path coverage (optional) -->
+  <!-- true: load the coverage global planner into move_base and start path_coverage -->
+  <arg name="use_coverage" default="true"/>
+  <!-- "diff" or "mecanum", only used when use_coverage is true -->
+  <arg name="drive_type" default="mecanum"/>
+  <!-- mecanum only: "sweep", "current" or a yaw in degrees -->
+  <arg name="mecanum_heading" default="sweep"/>
+  <!-- drive around each cell before the lanes -->
+  <arg name="border_drive" default="false"/>
 
   <!-- Map server -->
   <node pkg="map_server" name="map_server" type="map_server" args="$(arg map_file)"/>
@@ -24,7 +34,7 @@
   </group>
 
   <!-- move_base -->
-	<node pkg="move_base" type="move_base" respawn="false" name="move_base" output="screen" launch-prefix="bash -c 'sleep $(arg node_start_delay); $0 $@'">
+	<node pkg="move_base" type="move_base" respawn="false" name="move_base" output="screen" clear_params="true" launch-prefix="bash -c 'sleep $(arg node_start_delay); $0 $@'">
   	  	<rosparam file="$(find nox)/cfg/costmap_common_params.yaml" command="load" ns="global_costmap" />
   	 	<rosparam file="$(find nox)/cfg/costmap_common_params.yaml" command="load" ns="local_costmap" />
   		<rosparam file="$(find nox)/cfg/local_costmap_params.yaml" command="load" />
@@ -33,7 +43,18 @@
 		<rosparam file="$(find nox)/cfg/move_base_params.yaml" command="load" />
 		<!-- <param name="base_local_planner" value="dwa_local_planner/DWAPlannerROS" /> -->
 		<param name="base_local_planner" value="teb_local_planner/TebLocalPlannerROS" />
+		<!-- must stay after the files above, it overrides some of their values.
+		     A wrong drive_type stops the launch because its yaml file does not exist -->
+		<rosparam if="$(arg use_coverage)" file="$(find path_coverage)/config/coverage_planner.yaml" command="load" />
+		<rosparam if="$(arg use_coverage)" file="$(find path_coverage)/config/coverage_planner_$(arg drive_type).yaml" command="load" />
 	</node>
+
+  <!-- path coverage node: click the zone in RViz, commands on /path_coverage/command -->
+  <include if="$(arg use_coverage)" file="$(find path_coverage)/launch/path_coverage.launch">
+    <arg name="drive_type" value="$(arg drive_type)"/>
+    <arg name="mecanum_heading" value="$(arg mecanum_heading)"/>
+    <arg name="border_drive" value="$(arg border_drive)"/>
+  </include>
 
   <!-- rviz -->
   <group if="$(arg open_rviz)"> 

@@ -54,7 +54,7 @@ TebLocalPlannerROS:
   max_vel_y_backwards: 0.0
   acc_lim_y: 0.4
   max_vel_x: 0.2 #0.25 
-  max_vel_x_backwards: 0.0 #0.2
+  max_vel_x_backwards: 0.15 #0.2
   max_vel_theta: 0.4 #0.5
   acc_lim_x: 0.6 # 0.2
   acc_lim_theta: 0.6 #0.5, 0.26
@@ -72,8 +72,8 @@ TebLocalPlannerROS:
 
   # GoalTolerance
       
-  xy_goal_tolerance: 0.25 #0.2
-  yaw_goal_tolerance: 0.52
+  xy_goal_tolerance: 0.08 #0.2
+  yaw_goal_tolerance: 0.15
   free_goal_vel: false
   allow_init_with_backwards_motion: False
   # Obstacles
@@ -101,12 +101,12 @@ TebLocalPlannerROS:
   weight_acc_lim_y: 1.5 #1
   weight_acc_lim_x: 1 # 1
   weight_acc_lim_theta: 1 # 1
-  weight_kinematics_nh: 10 #1000
+  weight_kinematics_nh: 1 #1000
   weight_kinematics_forward_drive: 0 #1000
   weight_kinematics_turning_radius: 0 #1 #only for car-like robots
   weight_optimaltime: 1.0 #1
   weight_obstacle: 50 #50
-  weight_viapoint: 0.0 #5.0 #1.0
+  weight_viapoint: 5.0 #5.0 #1.0
   weight_inflation: 0.5 #0.1
   weight_dynamic_obstacle: 5 # not in use yet
   selection_alternative_time_cost: False # not in use yet
@@ -126,7 +126,7 @@ TebLocalPlannerROS:
   visualize_hc_graph: False
 
   #ViaPoints
-  global_plan_viapoint_sep: -0.1 #negative if none
+  global_plan_viapoint_sep: 0.15 #negative if none
   via_points_ordered: False #adhere to order of via points
 
   #Feedback

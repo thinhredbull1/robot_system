@@ -1,0 +1,4 @@
+[submodule "src/path_coverge_ros"]
+	path = src/path_coverge_ros
+	url = https://github.com/thinhredbull1/path_coverge_ros.git
+	branch = coverage_planner

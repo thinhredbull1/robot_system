@@ -1,5 +1,16 @@
 <launch>
 
+    <!-- Foxglove bridge (replaces RViz). Connect Foxglove to ws://<robot_ip>:<foxglove_port> -->
+    <arg name="use_foxglove" default="true"/>
+    <arg name="foxglove_port" default="8765"/>
+
+    <include
+        file="$(find foxglove_bridge)/launch/foxglove_bridge.launch"
+        if="$(arg use_foxglove)"
+    >
+        <arg name="port" value="$(arg foxglove_port)"/>
+    </include>
+
     <node
         pkg="localize_manager"
         type="localize_manager_node.py"
